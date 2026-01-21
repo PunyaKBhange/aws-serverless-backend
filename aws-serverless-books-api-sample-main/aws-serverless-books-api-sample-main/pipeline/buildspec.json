@@ -1,0 +1,48 @@
+{
+    "version": 0.2,
+    "env": {
+      "exported-variables": [
+        "ARTIFACTS_PATH"
+      ]
+    },
+    "phases": {
+      "install": {
+        "runtime-versions": {
+          "python": 3.8,
+          "nodejs": 22
+        },
+        "commands": [
+          "pip3 install --upgrade aws-sam-cli"
+        ]
+      },
+      "pre_build": {
+        "commands": [
+          "npm i -g recursive-install esbuild",
+          "npm-recursive-install --rootDir=src",
+          "cd src/books/create",
+          "npm test",
+          "cd ../get-all",
+          "npm test"
+        ]
+      },
+      "build": {
+        "commands": [
+          "cd ../../..",
+          "sam build"          
+        ]
+      },
+      "post_build": {
+        "commands": [
+          "export TODAY=$(date +%Y-%m-%d-%H-%M-%S)",
+          "export ARTIFACTS_PATH=s3://$S3_BUCKET/$GIT_BRANCH/$TODAY.yml",
+          "sam package --s3-bucket $S3_BUCKET --s3-prefix $GIT_BRANCH --output-template-file out.yml --region $AWS_REGION",
+          "aws s3 cp out.yml $ARTIFACTS_PATH"
+        ]
+      }
+    },
+    "artifacts": {	
+      "files": [	
+        "out.yml"	
+      ]	
+    }
+  }

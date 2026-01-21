@@ -1,0 +1,349 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+# AWS SAM Template: Books API
+# 
+# This template defines a complete serverless REST API with:
+# - API Gateway for HTTP routing and authentication
+# - Lambda functions for business logic
+# - DynamoDB for data persistence
+# - Cognito for user authentication
+# - CloudWatch for monitoring and alarms
+# - CodeDeploy for safe, gradual deployments
+#
+# Architecture: API Gateway → Lambda → DynamoDB
+# Security: IAM least privilege, Cognito auth, encryption at rest/transit
+# Deployment: Gradual rollout with pre-traffic validation and automatic rollback
+
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: 'AWS::Serverless-2016-10-31'
+
+# Parameters allow environment-specific configuration
+# This enables deploying the same template to staging and production
+# with different behaviors (e.g., deployment strategy, authentication)
+Parameters:
+  Stage:
+    Type: String
+    Description: Stage to deploy resources to
+    AllowedValues:
+      - staging
+      - production
+
+# Conditions enable conditional resource creation and configuration
+# Used to apply stricter controls and gradual deployments in production
+Conditions:
+  IsProduction: !Equals [ !Ref Stage, production ]
+
+# Global configuration applied to all resources of the same type
+# Reduces repetition and ensures consistency across functions
+Globals:
+  Api:
+    OpenApiVersion: 3.0.1  # Prevents SAM from creating default stage
+  Function:
+    Runtime: nodejs22.x     # Node.js 22 LTS
+    MemorySize: 512         # MB - Also determines CPU allocation
+    Timeout: 5              # Seconds - Max execution time
+    Tracing: Active         # Enable AWS X-Ray distributed tracing
+    Tags:
+      project: my-project
+      environment: !Ref Stage  # Tag resources for cost allocation
+
+Resources:
+
+  # API Gateway requires an IAM role to write logs to CloudWatch
+  # This is a one-time account-level configuration
+  ApiGwAccountConfig:
+    Type: "AWS::ApiGateway::Account"
+    Properties:
+      CloudWatchRoleArn: !GetAtt "ApiGatewayLoggingRole.Arn"
+      
+  # IAM Role: Allows API Gateway to write logs to CloudWatch
+  # Security: Least privilege - only CloudWatch Logs write permission
+  ApiGatewayLoggingRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - "apigateway.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs"
+        
+  # API Gateway: REST API frontend
+  # Handles HTTP routing, authentication, logging, and tracing
+  # Security: Cognito authorizer validates JWT tokens before Lambda invocation
+  BooksApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "books-api-${Stage}"
+      StageName: !Ref Stage
+      MethodSettings:
+        - LoggingLevel: INFO          # Log all requests to CloudWatch
+          ResourcePath: '/*'          # Apply to all endpoints
+          HttpMethod: '*'             # Apply to all HTTP methods
+      TracingEnabled: true            # Enable X-Ray tracing for performance monitoring
+      Variables:
+        LAMBDA_ALIAS: !Ref Stage      # Stage variable for Lambda alias routing
+      Auth:
+        Authorizers:
+          CognitoAuth:                # JWT token validator
+            UserPoolArn: !GetAtt CognitoUserPool.Arn
+  
+  # Lambda Function: Get All Books
+  # Public endpoint (no authentication required)
+  # Performs DynamoDB Scan and returns all books as JSON
+  GetAllBooks:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild          # TypeScript compiler
+      BuildProperties:
+        Format: cjs                 # CommonJS for Node.js compatibility
+        Minify: true                # Reduce package size
+        Target: "es2020"            # JavaScript target version
+        Sourcemap: false            # Disable source maps in production
+        EntryPoints:
+          - index.ts
+    Properties:
+      FunctionName: !Sub '${Stage}-books-get-all'
+      CodeUri: src/books/get-all/
+      Handler: index.handler
+      AutoPublishAlias: !Ref Stage  # Create alias for gradual deployments
+      DeploymentPreference:
+        # Production: Gradual rollout (10% traffic every 1 minute)
+        # Staging: Immediate deployment (all traffic at once)
+        Type: !If [IsProduction, Linear10PercentEvery1Minute, AllAtOnce]        
+        Alarms:
+          # Automatic rollback if error rate > 0 during deployment
+          - !Ref GetAllBooksAliasErrorMetricGreaterThanZeroAlarm
+      Environment:
+        Variables:
+          TABLE: !Ref BooksTable    # DynamoDB table name injected as env var
+      Policies:
+        # IAM Least Privilege: Read-only access to Books table
+        # Cannot write, update, or delete items
+        - DynamoDBReadPolicy:
+            TableName: !Ref BooksTable
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /books
+            Method: get
+            RestApiId:
+              Ref: BooksApi
+            # No Auth specified = public endpoint
+  
+  # Lambda Function: Create Book
+  # Protected endpoint (requires Cognito authentication)
+  # Parses request body and writes to DynamoDB
+  CreateBook:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Format: cjs
+        Minify: true
+        Target: "es2020"
+        Sourcemap: false
+        EntryPoints:
+          - index.ts
+    Properties:
+      FunctionName: !Sub '${Stage}-books-create'
+      CodeUri: src/books/create/
+      Handler: index.handler
+      AutoPublishAlias: !Ref Stage
+      DeploymentPreference:
+        Type: !If [IsProduction, Linear10PercentEvery1Minute, AllAtOnce]
+        Hooks:
+          # Pre-traffic hook: Smoke test new version before shifting traffic
+          # Only runs in production (staging uses AllAtOnce deployment)
+          PreTraffic: !Ref CreateBookPreTraffic
+        Alarms:
+          # Automatic rollback if error rate > 0 during deployment
+          - !Ref CreateBookAliasErrorMetricGreaterThanZeroAlarm
+      Environment:
+        Variables:
+          TABLE: !Ref BooksTable
+      Policies:
+        # IAM Least Privilege: Write-only access to Books table
+        # Cannot read or delete items (doesn't need to)
+        - DynamoDBWritePolicy:
+            TableName: !Ref BooksTable
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /books
+            Method: post
+            RestApiId:
+              Ref: BooksApi
+            Auth:
+              # Required OAuth scopes for authentication
+              AuthorizationScopes:
+                - email  # Required in all environments
+                # Staging: Allow aws.cognito.signin.user.admin for automated testing
+                # Production: Only email scope (more restrictive)
+                - !If
+                  - IsProduction
+                  - !Ref 'AWS::NoValue'
+                  - aws.cognito.signin.user.admin
+              Authorizer: CognitoAuth  # API Gateway validates JWT before Lambda invocation
+
+  # DynamoDB Table: Books storage
+  # NoSQL database with single-table design
+  # Security: Encryption at rest enabled, least-privilege IAM access
+  BooksTable:
+    Type: AWS::Serverless::SimpleTable
+    Properties:
+      PrimaryKey:
+        Name: isbn              # Partition key (unique book identifier)
+        Type: String
+      TableName: !Sub '${Stage}-books'  # Environment-specific table names
+      Tags:
+        project: my-project
+        environment: !Ref Stage
+      SSESpecification:
+        SSEEnabled: true        # Encryption at rest using AWS-managed keys
+
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${Stage}-books-api-user-pool"
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 6
+          RequireLowercase: false
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: false
+      UsernameAttributes:
+        - email
+      Schema:
+        - AttributeDataType: String
+          Name: email
+          Required: false
+
+  UserPoolClient:
+    Type: "AWS::Cognito::UserPoolClient"
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - implicit
+      AllowedOAuthScopes:
+        - email
+        - openid
+      CallbackURLs:
+        - https://aws.amazon.com/
+      SupportedIdentityProviders:
+        - COGNITO
+      ExplicitAuthFlows:
+        - ALLOW_REFRESH_TOKEN_AUTH 
+        - !If
+          - IsProduction
+          - !Ref 'AWS::NoValue'
+          - ALLOW_USER_PASSWORD_AUTH
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties: 
+      Domain: !Sub "book-api-${Stage}-${AWS::AccountId}"
+      UserPoolId: !Ref CognitoUserPool
+
+  CreateBookPreTraffic:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Format: cjs
+        Minify: true
+        Target: "es2020"
+        Sourcemap: false
+        EntryPoints:
+          - index.ts
+    Properties:
+      FunctionName: !Sub 'CodeDeployHook_${Stage}-books-create-pre-traffic-check'
+      CodeUri: src/books/create-pre-traffic/
+      Handler: index.handler
+      Environment:
+        Variables:
+          TABLE: !Ref BooksTable
+          FN_NEW_VERSION: !Ref CreateBook.Version
+      Tags:
+        project: my-project
+        environment: !Ref Stage
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BooksTable
+        - Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+              - codedeploy:PutLifecycleEventHookExecutionStatus
+            Resource:
+              !Sub 'arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentgroup:${ServerlessDeploymentApplication}/*'
+        - Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+            Resource: !Ref CreateBook.Version
+
+  # CloudWatch Alarm: CreateBook Error Monitoring
+  # Triggers if CreateBook Lambda has any errors during deployment
+  # Used by CodeDeploy to automatically rollback bad deployments
+  CreateBookAliasErrorMetricGreaterThanZeroAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Lambda Function Error > 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Resource
+          Value: !Sub '${CreateBook}:${Stage}'  # Monitor specific alias
+        - Name: FunctionName
+          Value: !Ref CreateBook
+      EvaluationPeriods: 2      # Alarm after 2 consecutive periods with errors
+      MetricName: Errors        # Lambda automatically publishes this metric
+      Namespace: AWS/Lambda
+      Period: 60                # 60 second evaluation window
+      Statistic: Sum            # Total errors in period
+      Threshold: 0              # Any error triggers alarm
+
+  # CloudWatch Alarm: GetAllBooks Error Monitoring
+  # Triggers if GetAllBooks Lambda has any errors during deployment
+  # Used by CodeDeploy to automatically rollback bad deployments
+  GetAllBooksAliasErrorMetricGreaterThanZeroAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Lambda Function Error > 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Resource
+          Value: !Sub '${GetAllBooks}:${Stage}'  # Monitor specific alias
+        - Name: FunctionName
+          Value: !Ref GetAllBooks
+      EvaluationPeriods: 2
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Period: 60
+      Statistic: Sum
+      Threshold: 0
+
+Outputs:
+  ApiEndpoint:
+    Description: "API endpoint"
+    Value: !Sub "https://${BooksApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/"
+  UserPoolId:
+    Description: "User Pool Id"
+    Value: !Ref CognitoUserPool
+  UserPoolClientId:
+    Description: "User Pool Client Id"
+    Value: !Ref UserPoolClient
+  BooksTable:
+    Description: "DynamoDB table where we will be storing books"
+    Value: !Ref BooksTable

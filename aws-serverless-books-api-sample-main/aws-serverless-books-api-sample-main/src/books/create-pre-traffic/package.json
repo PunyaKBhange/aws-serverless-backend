@@ -1,0 +1,21 @@
+{
+  "name": "books-create-pre-traffic",
+  "version": "1.0.0",
+  "description": "Lambda function to perform smoke test for book creation",
+  "main": "index.js",
+  "scripts": {
+    "build": "tsc"
+  },
+  "author": "Amazon Web Services",
+  "license": "ISC",
+  "dependencies": {
+    "aws-sdk": "^2.1692.0"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.147",
+    "@types/node": "^22.13.5",
+    "esbuild": "^0.25.1",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.3"
+  }
+}

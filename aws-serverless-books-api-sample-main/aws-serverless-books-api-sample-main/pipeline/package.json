@@ -1,0 +1,25 @@
+{
+  "name": "pipeline",
+  "version": "0.1.0",
+  "bin": {
+    "pipeline": "bin/pipeline.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "cdk": "cdk"
+  },
+  "author": "Amazon Web Services",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/node": "^22.13.4",
+    "aws-cdk": "^2.1000.2",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.3"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.189.1",
+    "constructs": "^10.4.2",
+    "source-map-support": "^0.5.21"
+  }
+}

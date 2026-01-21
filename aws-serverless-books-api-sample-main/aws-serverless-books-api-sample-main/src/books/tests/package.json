@@ -1,0 +1,20 @@
+{
+  "name": "e2e-tests",
+  "version": "1.0.0",
+  "description": "End-to-end tests for the Book API",
+  "main": "index.js",
+  "scripts": {
+    "test": "mocha index.js --timeout 5000"
+  },
+  "author": "Amazon Web Services",
+  "license": "ISC",
+  "dependencies": {
+    "aws-sdk": "^2.1692.0",
+    "axios": ">=1.8.3",
+    "uuid": "^11.1.0"
+  },
+  "devDependencies": {
+    "chai": "^4.2.0",
+    "mocha": "^11.1.0"
+  }
+}
